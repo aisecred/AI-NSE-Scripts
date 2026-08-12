@@ -144,12 +144,14 @@ When run alongside `http-ai-enum.nse` (using `--script http-ai-enum,http-mcp-enu
 Tried in order:
 
 1. **`.well-known/mcp`** — reads the server's canonical endpoint path and transport type before guessing
-2. **Streamable HTTP** — POST to `/mcp`, `/`, `/rpc`, `/api`, `/v1`
-3. **SSE (legacy)** — GET `/sse`, `/events`, `/stream`, `/v1/sse`, `/api/sse`, `/mcp/sse`, `/mcp/stream` to discover the message endpoint, then POST to it
+2. **Streamable HTTP** — POST to `/mcp`, `/`, `/rpc`, `/api`, `/v1`. The 2026-07-28 stateless protocol is tried first on each candidate endpoint, falling back to the legacy stateful handshake
+3. **SSE (legacy)** — GET `/sse`, `/events`, `/stream`, `/v1/sse`, `/api/sse`, `/mcp/sse`, `/mcp/stream` to discover the message endpoint, then POST to it (legacy stateful protocol only — there is no SSE-discovery equivalent under the stateless protocol). Handles both response styles a server may use: synchronous (the JSON-RPC reply comes back in the POST response) and async-push (the POST returns a bare `202 Accepted`, and the reply arrives as a later event pushed on the original SSE stream instead — this connection is kept open via a raw socket for exactly that purpose, including through `call=1`/`read=1`)
 
 ### Protocol version fallback
 
-Sends `initialize` with protocol version `2025-03-26` first. If the server returns a JSON-RPC error, retries automatically with `2024-11-05`.
+**2026-07-28 (stateless, tried first):** No `initialize`/session. Bootstraps directly with a `tools/list` call carrying `protocolVersion`, `clientCapabilities`, and `clientInfo` in the request's `_meta` field, plus `Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version` HTTP headers. Server identity comes from `_meta["io.modelcontextprotocol/serverInfo"]` in the response, since there's no `initialize` response to read it from. A rejected bootstrap (JSON-RPC error `-32020`, `-32021`, or `-32022` — all new in this spec revision) is itself treated as proof of a 2026-07-28 server and reported as a `note`, since those codes didn't exist before.
+
+**Legacy stateful (fallback):** Sends `initialize` with protocol version `2025-11-25` first. If the server returns a JSON-RPC error, retries automatically with `2025-03-26`, then `2024-11-05`.
 
 ### What gets enumerated
 
@@ -157,8 +159,8 @@ Sends `initialize` with protocol version `2025-03-26` first. If the server retur
 - **Resources** — static URIs with human-readable names
 - **Resource templates** — RFC 6570 URI patterns (e.g. `file:///{path}`, `db://{table}/{id}`) that reveal what the server can serve on demand
 - **Prompts** — names, descriptions, argument schemas (required args annotated with `*`), and template text via `prompts/get`
-- **Capabilities** — full capability set from the `initialize` response
-- **Session ID** — for Streamable HTTP stateful sessions
+- **Capabilities** — full capability set from the `initialize` response (legacy stateful protocol only — Roots/Sampling/Logging capability negotiation is deprecated under the 2026-07-28 stateless protocol)
+- **Session ID** — for Streamable HTTP stateful sessions (legacy protocol only; the 2026-07-28 stateless protocol has no session)
 
 All list methods are paginated (`nextCursor` followed for up to `max_pages` pages per method).
 
@@ -170,17 +172,18 @@ All list methods are paginated (`nextCursor` followed for up to `max_pages` page
 | `auth: AUTHENTICATED` | Credentials were supplied and the server responded 200 |
 | `auth: 401 Unauthorized — Bearer required` | Confirmed MCP server behind auth; scheme from `WWW-Authenticate` |
 | `CORS:*` | `Access-Control-Allow-Origin: *` on the MCP endpoint — any web origin can call this server |
-| `WARNING: sampling capability` | Server can request LLM calls from connected clients, consuming their API credits or exfiltrating context |
+| `WARNING: ...unsolicited sampling/createMessage...` | Server attempted to invoke an LLM completion through us despite never being granted sampling support — a protocol violation, and a real attempt (not just a declared capability) to consume the client's API credits or exfiltrate context. Checked on every `prompts/get` call (runs by default) and, with `call=1`/`read=1`, on every tool call and resource read. |
 | `capability notes: logging` | Server can push log messages to connected clients |
 | `capability notes: completions` | Argument autocompletion reveals valid parameter values |
+| `needs further input: <method>` | A tool call, resource read, or prompt fetch was interrupted by a server-initiated request (e.g. `elicitation/create`) instead of completing — reported rather than silently dropped; the round-trip itself isn't attempted |
 
 ### Script arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `http-mcp-enum.timeout=N` | 6000 | Per-request HTTP timeout in milliseconds |
-| `http-mcp-enum.call=1` | off | Call each tool using its required parameters as keys with empty string values. Gets past argument-presence validation into tool logic, often revealing path structures, DB schemas, or error details. |
-| `http-mcp-enum.read=1` | off | Read the first three discovered resources via `resources/read` and show a content preview |
+| `http-mcp-enum.call=1` | off | Actually calls every discovered tool (not just lists it), using its required parameter names as keys with empty string values. Empty strings usually pass argument-*presence* validation but not deeper checks, so the call proceeds into real tool logic and the response often reveals more than the tool's description did — SQL errors exposing schema, a secret handed back with no auth check, a server-initiated request the tool needed to complete (reported as `needs further input: <method>`). Result is shown in each tool's `call` field. |
+| `http-mcp-enum.read=1` | off | Reads the content of the first three discovered resources via `resources/read` and shows a preview, so you can see what a resource actually contains rather than just its name/URI. |
 | `http-mcp-enum.max_tools=N` | unlimited | Maximum number of tools to display |
 | `http-mcp-enum.max_pages=N` | 5 | Maximum pagination pages to follow per list method |
 | `http-mcp-enum.token=VALUE` | — | Bearer token — sends `Authorization: Bearer VALUE` on all requests |
@@ -247,6 +250,25 @@ PORT     STATE SERVICE
 |_      template: You are a helpful assistant with access to the filesystem...
 ```
 
+A 2026-07-28 stateless server looks the same but with no `session_id` or `capabilities`, and a distinct `transport` label. This example is real output captured against a genuine 2026-07-28-only test server — not illustrative like the one above — which is also why there's no `server:` line: this particular server doesn't populate `_meta.serverInfo` in its responses, and the script has nothing to fall back on since there's no `initialize` response under this protocol to read a name from:
+
+```
+PORT     STATE SERVICE
+3001/tcp open  http
+| http-mcp-enum:
+|   transport: streamable-http (stateless, 2026-07-28)
+|   endpoint: /mcp
+|   auth: UNAUTHENTICATED
+|   protocol: 2026-07-28
+|   tools (2):
+|     get_status:
+|       description: Return service status.
+|       call: ok: ok
+|     link_account:
+|       description: Link an external account.
+|_      call: ok
+```
+
 ---
 
 ## Running both scripts together
@@ -302,6 +324,6 @@ nmap --script http-mcp-enum -oX mcp-scan.xml <target>
 
 ## Notes
 
-- `http-mcp-enum.call=1` sends tool invocations with empty argument values. On most servers this triggers validation errors rather than actual execution, but on servers with no required parameters a tool may execute. Use with appropriate authorization.
+- `http-mcp-enum.call=1` sends real tool invocations with empty argument values — this is active probing, not passive listing. On a tool with no required parameters, or one that only checks argument presence, the call can execute for real rather than just fail validation; on strictly-validated tools it usually surfaces a validation error instead, which is still useful (e.g. confirms the parameter is server-side-enforced). Either way, something the tool's static description didn't say gets surfaced. Use with appropriate authorization.
 - `http-mcp-enum.read=1` reads resources the server has already listed as accessible. It does not attempt to read resources outside the server's advertised list.
 - The MCP probe in `http-ai-enum.nse` sends a POST `initialize` request to confirm MCP servers. Use `http-ai-enum.no_post=1` if POST requests are not acceptable in your environment — all GET-based probes still run.

@@ -174,7 +174,7 @@ local PROBES = {}
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/tags")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, '"models"') then return nil end
   return { service = "Ollama", path = "/api/tags",
            auth = auth_of(r), cors = cors_open(r),
@@ -183,7 +183,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/version")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   local ver = jstr(r.body, "version")
   -- Ollama payload is tiny (<80 bytes); skip larger generic /api/version responses
   if ver and #(r.body or "") < 80 then
@@ -196,7 +196,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/props")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "default_generation_settings") then return nil end
   local model = jstr(r.body, "model_path") or jstr(r.body, "model")
   return { service = "llama.cpp server", path = "/props",
@@ -209,7 +209,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/info")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "model_id") or not has(r.body, "model_dtype") then return nil end
   if has(r.body, "max_batch_tokens") then return nil end  -- that's TEI, handled below
   local model = jstr(r.body, "model_id")
@@ -224,7 +224,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/info")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "model_id") or not has(r.body, "max_batch_tokens") then return nil end
   local model = jstr(r.body, "model_id")
   return { service = "HuggingFace TEI", path = "/info",
@@ -236,9 +236,9 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v2/health/ready")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   local meta = cget("/v2")  -- cached; free if already fetched
-  if not meta or not has(meta.body, "triton") then return nil end
+  if not meta or not has(meta.body, "triton") or is_html(meta) then return nil end
   local mr = cget("/v2/models")
   return { service = "Triton Inference Server", path = "/v2/health/ready",
            auth = auth_of(r), cors = cors_open(r),
@@ -252,7 +252,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v1/models")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, '"data"') then return nil end
 
   local svc  = "OpenAI-compatible API"
@@ -283,7 +283,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v0/models")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "publisher") and not has(r.body, '"arch"') then return nil end
   return { service = "LM Studio", path = "/api/v0/models",
            auth = auth_of(r), cors = cors_open(r),
@@ -294,7 +294,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/info")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "kobold") then return nil end
   return { service = "KoboldCPP", path = "/api/v1/info",
            auth = auth_of(r), cors = cors_open(r),
@@ -304,7 +304,7 @@ end
 -- /api/v1/model is shared with Text Gen WebUI — check for oobabooga markers first
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/model")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "oobabooga") or has(r.body, "text-generation-webui") then return nil end
   local model = jstr(r.body, "result")
   if model then
@@ -317,7 +317,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/model")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "oobabooga") or has(r.body, "text-generation-webui") then
     return { service = "Text Generation WebUI", path = "/api/v1/model",
              auth = auth_of(r), cors = cors_open(r) }
@@ -328,7 +328,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v1/health")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "tabby") or has(hdr(r, "server"), "tabby") then
     return { service = "Tabby", path = "/v1/health",
              auth = auth_of(r), cors = cors_open(r) }
@@ -351,7 +351,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/readyz")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "localai") or has(hdr(r, "server"), "localai") then
     return { service = "LocalAI", path = "/readyz",
              auth = auth_of(r), cors = cors_open(r) }
@@ -374,7 +374,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/models")
-  if r and r.status == 200 then
+  if r and r.status == 200 and not is_html(r) then
     if has(r.body, "open-webui") or has(r.body, "openwebui")
     or has(hdr(r, "x-powered-by"), "open-webui") then
       return { service = "Open WebUI", path = "/api/models",
@@ -382,7 +382,7 @@ PROBES[#PROBES+1] = function(cget, _)
     end
   end
   local vr = cget("/api/version")
-  if vr and vr.status == 200
+  if vr and vr.status == 200 and not is_html(vr)
   and (has(vr.body, "open-webui") or has(vr.body, "openwebui")
   or has(hdr(vr, "x-powered-by"), "open-webui")) then
     return { service = "Open WebUI", path = "/api/version",
@@ -396,7 +396,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/system")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "anythingllm") or has(r.body, "vectordb")
   or (has(r.body, "version") and has(r.body, "storage_type")) then
     return { service = "AnythingLLM", path = "/api/v1/system",
@@ -410,7 +410,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/system_stats")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "system") or not has(r.body, "devices") then return nil end
   if has(r.body, "comfyui") or has(r.body, "vram_total") or has(r.body, "torch_version") then
     -- Version may be a string or number; try both quote styles
@@ -426,14 +426,14 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/chatflows")
-  if r and r.status == 200
+  if r and r.status == 200 and not is_html(r)
   and (has(r.body, "chatflowType") or has(r.body, "flowData")
   or has(hdr(r, "server"), "flowise")) then
     return { service = "Flowise", path = "/api/v1/chatflows",
              auth = auth_of(r), cors = cors_open(r) }
   end
   local pr = cget("/api/v1/ping")
-  if not pr or pr.status ~= 200 then return nil end
+  if not pr or pr.status ~= 200 or is_html(pr) then return nil end
   if has(pr.body, '"pong"') or has(hdr(pr, "server"), "flowise")
   or has(hdr(pr, "x-powered-by"), "flowise") then
     local auth = (r and r.status == 401) and "401 Unauthorized" or auth_of(pr)
@@ -446,7 +446,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/health_check")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "langflow") or has(hdr(r, "server"), "langflow") then
     return { service = "Langflow", path = "/api/v1/health_check",
              auth = auth_of(r), cors = cors_open(r) }
@@ -457,7 +457,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/app-version")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "sillytavern") then
     return { service = "SillyTavern", path = "/api/app-version",
              auth = auth_of(r), cors = cors_open(r),
@@ -469,7 +469,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/readyz")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "bentoml") or has(hdr(r, "server"), "bentoml") then
     return { service = "BentoML", path = "/readyz",
              auth = auth_of(r), cors = cors_open(r) }
@@ -481,7 +481,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/config")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "gradio") or has(hdr(r, "server"), "gradio") then
     return { service = "Gradio", path = "/config",
              auth = auth_of(r), cors = cors_open(r),
@@ -509,7 +509,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/health")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "librechat") or has(hdr(r, "server"), "librechat")
   or has(hdr(r, "x-powered-by"), "librechat") then
     return { service = "LibreChat", path = "/api/health",
@@ -517,7 +517,7 @@ PROBES[#PROBES+1] = function(cget, _)
              version = jstr(r.body, "version") }
   end
   local ep = cget("/api/endpoints")
-  if ep and ep.status == 200
+  if ep and ep.status == 200 and not is_html(ep)
   and has(ep.body, '"openAI"') and has(ep.body, '"azureOpenAI"')
   and has(ep.body, '"anthropic"') then
     return { service = "LibreChat", path = "/api/health",
@@ -543,7 +543,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/get_model_info")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "model_path") and not has(r.body, '"tokenizer"') then return nil end
   local model = jstr(r.body, "model_path")
   return { service = "SGLang", path = "/get_model_info",
@@ -555,7 +555,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v1/cluster/info")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, "xinference") and not has(r.body, "xorbits") then return nil end
   local version = jstr(r.body, "version")
   local mr = cget("/v1/models")
@@ -571,7 +571,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v1/model")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, '"parameters"') or not has(r.body, '"object"') then return nil end
   local model = jstr(r.body, "id")
   return { service = "TabbyAPI", path = "/v1/model",
@@ -600,7 +600,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/info")
-  if r and r.status == 200 and has(r.body, "dify") then
+  if r and r.status == 200 and not is_html(r) and has(r.body, "dify") then
     return { service = "Dify", path = "/api/info",
              auth = auth_of(r), cors = cors_open(r) }
   end
@@ -616,10 +616,10 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/v1/app/version")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, '"version"') then return nil end
   local cr = cget("/api/v1/app/config")
-  if cr and cr.status == 200
+  if cr and cr.status == 200 and not is_html(cr)
   and (has(cr.body, "infill_methods") or has(cr.body, "invokeai")
   or has(cr.body, "force_tiled_decode")) then
     return { service = "InvokeAI", path = "/api/v1/app/version",
@@ -633,7 +633,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/API/GetCurrentStatus")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "backend_status") or has(r.body, "swarmui")
   or has(r.body, "current_model") or has(r.body, "ModelName") then
     return { service = "SwarmUI", path = "/API/GetCurrentStatus",
@@ -646,7 +646,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/models")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "queue_fraction") then
     return { service = "Infinity (Embeddings)", path = "/models",
              auth = auth_of(r), cors = cors_open(r),
@@ -659,7 +659,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/health")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "marqo") or (has(r.body, '"backend"') and has(r.body, "index_count")) then
     return { service = "Marqo", path = "/health",
              auth = auth_of(r), cors = cors_open(r) }
@@ -671,7 +671,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v1/engines")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, '"data"') and (has(r.body, "engine") or has(r.body, "fauxpilot")
   or has(r.body, "copilot") or has(r.body, "codex")) then
     return { service = "FauxPilot", path = "/v1/engines",
@@ -685,7 +685,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/assistants")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, '"avatar"') or has(r.body, '"instructions"')
   or has(r.body, "jan") or has(hdr(r, "server"), "jan") then
     return { service = "Jan", path = "/api/assistants",
@@ -699,7 +699,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/openapi.json")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, '"openapi"') then return nil end
   local body = r.body or ""
   local title = jstr(body, "title") or ""
@@ -797,7 +797,7 @@ PROBES[#PROBES+1] = function(cget, _)
              version = jstr(r.body, "version") }
   end
   r = cget("/collections")
-  if r and r.status == 200
+  if r and r.status == 200 and not is_html(r)
   and has(r.body, '"collections"') and has(r.body, '"status"') and has(r.body, '"time"') then
     return { service = "Qdrant", path = "/collections",
              auth = auth_of(r), cors = cors_open(r) }
@@ -808,7 +808,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/v1/meta")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "weaviate") or has(hdr(r, "server"), "weaviate") then
     return { service = "Weaviate", path = "/v1/meta",
              auth = auth_of(r), cors = cors_open(r),
@@ -820,7 +820,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/healthz")  -- cached; shared with n8n probe
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if not has(r.body, '"data"') or not has(r.body, '"code"') then return nil end
   local cr = cget("/v1/vector/collections")
   if cr and (cr.status == 200 or cr.status == 401) then
@@ -844,7 +844,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/status")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "last_activity") and has(r.body, "started") then
     return { service = "Jupyter", path = "/api/status",
              auth = auth_of(r), cors = cors_open(r) }
@@ -855,7 +855,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/experiments")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "tensorflow") or has(r.body, "tensorboard")
   or has(hdr(r, "server"), "tensorboard") then
     return { service = "TensorBoard", path = "/api/experiments",
@@ -867,7 +867,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/api/cluster_status")
-  if not r or r.status ~= 200 then return nil end
+  if not r or r.status ~= 200 or is_html(r) then return nil end
   if has(r.body, "rayVersion") and has(r.body, "nodes") then
     return { service = "Ray Dashboard", path = "/api/cluster_status",
              auth = auth_of(r), cors = cors_open(r),
@@ -879,7 +879,7 @@ end
 
 PROBES[#PROBES+1] = function(cget, _)
   local r = cget("/healthz")  -- cached; shared with Milvus probe
-  if r and r.status == 200 and (has(r.body, "n8n") or has(hdr(r, "server"), "n8n")) then
+  if r and r.status == 200 and not is_html(r) and (has(r.body, "n8n") or has(hdr(r, "server"), "n8n")) then
     return { service = "n8n", path = "/healthz",
              auth = auth_of(r), cors = cors_open(r) }
   end
@@ -977,11 +977,14 @@ PROBES[#PROBES+1] = function(cget, _)
 end
 
 -- MCP: JSON-RPC initialize (active POST)
--- Tries 2025-03-26 first; falls back to 2024-11-05 on JSON-RPC error.
+-- Tries 2025-11-25 first, then 2025-03-26, then 2024-11-05 on JSON-RPC error.
 
 PROBES[#PROBES+1] = function(_, cpost)
   if NO_POST then return nil end
 
+  local _MCP_INIT_LATEST = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' ..
+    '{"protocolVersion":"2025-11-25","capabilities":{},' ..
+    '"clientInfo":{"name":"nmap-http-ai-enum","version":"1.0"}}}'
   local _MCP_INIT_2025 = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' ..
     '{"protocolVersion":"2025-03-26","capabilities":{},' ..
     '"clientInfo":{"name":"nmap-http-ai-enum","version":"1.0"}}}'
@@ -999,7 +1002,7 @@ PROBES[#PROBES+1] = function(_, cpost)
   end
 
   for _, path in ipairs({ "/", "/mcp", "/rpc", "/v1", "/sse" }) do
-    local r = try_init(path, _MCP_INIT_2025) or try_init(path, _MCP_INIT_2024)
+    local r = try_init(path, _MCP_INIT_LATEST) or try_init(path, _MCP_INIT_2025) or try_init(path, _MCP_INIT_2024)
     if r then
       local proto = jstr(r.body, "protocolVersion")
       local sname = jstr(r.body, "name")
@@ -1084,7 +1087,7 @@ PROBES[#PROBES+1] = function(cget, _)
              auth = auth_of(asr), cors = cors_open(asr) }
   end
   local r = cget("/openapi.json")
-  if not r or r.status ~= 200 or not has(r.body, '"openapi"') then return nil end
+  if not r or r.status ~= 200 or is_html(r) or not has(r.body, '"openapi"') then return nil end
   local title = (jstr(r.body, "title") or ""):lower()
   local body  = (r.body or ""):lower()
   if (has(title, "whisper") or has(title, "asr") or has(title, "transcri") or has(title, "speech"))

@@ -12,19 +12,30 @@ resources, resource templates, and prompts via multiple transport methods.
 Transport methods tried in order:
   1. .well-known/mcp  — spec-defined discovery; gives canonical path and transport type
   2. Streamable HTTP  — POST to /mcp, /, /rpc, /api, /v1
+                         2026-07-28 stateless protocol tried first, then legacy stateful
   3. SSE (legacy)     — GET /sse, /events, /stream, /v1/sse, /api/sse, /mcp/sse, etc.
+                         handles both response styles: synchronous (JSON-RPC
+                         reply in the POST response) and async-push (POST
+                         returns a bare 202; the reply is a later event on
+                         the original SSE stream)
 
-For each discovered MCP server performs the full JSON-RPC handshake:
-  initialize (2025-03-26 with 2024-11-05 fallback)
+On each candidate endpoint, first tries the 2026-07-28 stateless protocol — no
+initialize/session, per-request _meta carrying protocol version and client
+capabilities instead. Falls back to the legacy stateful JSON-RPC handshake:
+  initialize (2025-11-25, falling back to 2025-03-26 then 2024-11-05)
   → notifications/initialized
-  → tools/list (paginated) + inputSchema required-param extraction
+Both paths then enumerate:
+  tools/list (paginated) + inputSchema required-param extraction
   → resources/list (paginated, static URIs + URI templates)
   → prompts/list (paginated) + prompts/get for each prompt
 
 Security signals surfaced automatically:
   auth:         UNAUTHENTICATED / 401 scheme / 403
   CORS:*        Access-Control-Allow-Origin: * on the MCP endpoint
-  WARNING:      server advertises sampling capability (can request LLM calls from clients)
+  WARNING:      server sent an unsolicited sampling/createMessage request — a protocol
+                violation, since we never declare client-side sampling support
+  needs further input: a tool call, resource read, or prompt fetch was interrupted by
+                a server-initiated request (e.g. elicitation/create) we didn't fulfill
 
 With http-mcp-enum.call=1, each tool is called using its required parameters as keys
 with empty string values.  This gets further into tool logic than a bare {} call and
@@ -107,6 +118,10 @@ end
 
 -- JSON-RPC constants
 
+local INIT_LATEST = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' ..
+  '{"protocolVersion":"2025-11-25","capabilities":{},' ..
+  '"clientInfo":{"name":"nmap-http-mcp-enum","version":"1.0"}}}'
+
 local INIT_2025 = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' ..
   '{"protocolVersion":"2025-03-26","capabilities":{},' ..
   '"clientInfo":{"name":"nmap-http-mcp-enum","version":"1.0"}}}'
@@ -116,6 +131,13 @@ local INIT_2024 = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' ..
   '"clientInfo":{"name":"nmap-http-mcp-enum","version":"1.0"}}}'
 
 local INIT_NOTIF = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+-- 2026-07-28 stateless protocol: no initialize/session — every request carries
+-- protocol version and client capabilities in params._meta instead.
+local STATELESS_VERSION = "2026-07-28"
+local STATELESS_META = '"_meta":{"io.modelcontextprotocol/protocolVersion":"' .. STATELESS_VERSION .. '",' ..
+  '"io.modelcontextprotocol/clientCapabilities":{},' ..
+  '"io.modelcontextprotocol/clientInfo":{"name":"nmap-http-mcp-enum","version":"1.0"}}'
 
 -- Pure helpers
 
@@ -182,6 +204,47 @@ local function next_cursor(body)
   if not body then return nil end
   local c = body:match('"nextCursor"%s*:%s*"([^"]*)"')
   return (c and c ~= "") and c or nil
+end
+
+local SAMPLING_WARNING = "WARNING: server sent an unsolicited sampling/createMessage " ..
+  "request — client never declared sampling support, so this is a protocol violation"
+
+-- Detects an unrequested sampling/createMessage attempt in a server response —
+-- the server trying to invoke an LLM completion through us despite our
+-- initialize/bootstrap never declaring client-side sampling support. Per spec
+-- a compliant server MUST NOT do this unless the client declared support, so
+-- seeing it here is itself the signal, regardless of which wire shape it uses:
+--   legacy:      a bare server-initiated JSON-RPC request (has "method", no
+--                "result"/"error")
+--   2026-07-28:  an InputRequiredResult naming it in inputRequests
+local function sampling_attempt(body)
+  if not body then return false end
+  if has(body, '"method"') and has(body, '"sampling/createMessage"')
+  and not has(body, '"result"') and not has(body, '"error"') then
+    return true
+  end
+  if has(body, '"resultType"') and has(body, '"input_required"')
+  and has(body, '"sampling/createMessage"') then
+    return true
+  end
+  return false
+end
+
+-- Detects a server-initiated request that needs a follow-up from us to
+-- complete the original call — e.g. elicitation/create or roots/list under
+-- MRTR (2026-07-28), or the pre-MRTR direct server-initiated pattern (same
+-- shape sampling_attempt checks, but for methods other than sampling, which
+-- gets its own WARNING above and isn't re-reported here). We don't attempt
+-- the round-trip; this just reports what was asked for instead of silently
+-- dropping it, which the plain result/error checks below would otherwise do.
+local function pending_request(body)
+  if not body then return nil end
+  local m = body:match('"method"%s*:%s*"([%w_%./%-]+)"')
+  if m and m ~= "sampling/createMessage"
+  and not has(body, '"result"') and not has(body, '"error"') then
+    return m
+  end
+  return nil
 end
 
 -- JSON parsers
@@ -316,6 +379,26 @@ local function parse_caps(body)
   return caps
 end
 
+-- JSON-RPC error code from a stateless-protocol response body (e.g. "-32021").
+-- -32020/-32021/-32022 are new in 2026-07-28 and are themselves proof of a
+-- stateless-capable server, even when the request was rejected.
+local function stateless_error_code(body)
+  if not body then return nil end
+  return body:match('"code"%s*:%s*(%-?%d+)')
+end
+
+-- Server identity from result._meta["io.modelcontextprotocol/serverInfo"] —
+-- there is no initialize response to read it from under the stateless protocol.
+local function stateless_server_info(body)
+  if not body then return nil, nil end
+  local res_block = body:match('"result"%s*:%s*(%b{})') or body
+  local meta = res_block:match('"_meta"%s*:%s*(%b{})')
+  if not meta then return nil, nil end
+  local info = meta:match('"io%.modelcontextprotocol/serverInfo"%s*:%s*(%b{})')
+  if not info then return nil, nil end
+  return info:match('"name"%s*:%s*"([^"]*)"'), info:match('"version"%s*:%s*"([^"]*)"')
+end
+
 -- HTTP wrappers
 
 local function json_post_opts(session_id)
@@ -334,6 +417,27 @@ local function post_rpc(host, port, path, body, session_id)
   return (ok and r and r.status) and r or nil
 end
 
+-- 2026-07-28 stateless protocol: Mcp-Method rides on every request, Mcp-Name
+-- on requests that name a tool/resource/prompt, MCP-Protocol-Version pins the
+-- version — no Mcp-Session-Id since there is no session.
+local function stateless_post_opts(method, name)
+  local h = {
+    ["Content-Type"]        = "application/json",
+    ["Accept"]               = "application/json, text/event-stream",
+    ["User-Agent"]           = "nmap-http-mcp-enum/1.0",
+    ["MCP-Protocol-Version"] = STATELESS_VERSION,
+    ["Mcp-Method"]           = method,
+  }
+  if name        then h["Mcp-Name"]  = name       end
+  if AUTH_HEADER then h[AUTH_HEADER] = AUTH_VALUE  end
+  return { timeout = TIMEOUT, header = h }
+end
+
+local function post_rpc_stateless(host, port, path, body, method, name)
+  local ok, r = pcall(http.post, host, port, path, stateless_post_opts(method, name), nil, body)
+  return (ok and r and r.status) and r or nil
+end
+
 local function get_req(host, port, path)
   local h = {
     ["User-Agent"] = "nmap-http-mcp-enum/1.0",
@@ -346,7 +450,11 @@ end
 
 -- Pagination
 
-local function fetch_paged(host, port, endpoint, session_id, method, req_id, parser)
+-- poster defaults to post_rpc; try_sse passes a poster that redirects to the
+-- open SSE stream when a server accepts requests asynchronously (see
+-- make_sse_poster below) instead of answering the POST directly.
+local function fetch_paged(host, port, endpoint, session_id, method, req_id, parser, poster)
+  poster = poster or post_rpc
   local all    = {}
   local cursor = nil
   for _ = 1, MAX_PAGES do
@@ -359,7 +467,29 @@ local function fetch_paged(host, port, endpoint, session_id, method, req_id, par
       req_body = string.format(
         '{"jsonrpc":"2.0","id":%d,"method":"%s","params":{}}', req_id, method)
     end
-    local r = post_rpc(host, port, endpoint, req_body, session_id)
+    local r = poster(host, port, endpoint, req_body, session_id)
+    if not r or r.status ~= 200 then break end
+    local body = unwrap_sse(r.body or "")
+    for _, item in ipairs(parser(body)) do all[#all+1] = item end
+    cursor = next_cursor(body)
+    if not cursor then break end
+  end
+  return all
+end
+
+-- Pagination — stateless protocol variant. Same nextCursor mechanic; each page
+-- carries the full _meta block instead of a session_id.
+
+local function fetch_paged_stateless(host, port, endpoint, method, name, req_id, parser)
+  local all    = {}
+  local cursor = nil
+  for _ = 1, MAX_PAGES do
+    local params = cursor
+      and string.format('"cursor":"%s",%s', cursor:gsub('"', '\\"'), STATELESS_META)
+      or STATELESS_META
+    local req_body = string.format('{"jsonrpc":"2.0","id":%d,"method":"%s","params":{%s}}',
+      req_id, method, params)
+    local r = post_rpc_stateless(host, port, endpoint, req_body, method, name)
     if not r or r.status ~= 200 then break end
     local body = unwrap_sse(r.body or "")
     for _, item in ipairs(parser(body)) do all[#all+1] = item end
@@ -390,11 +520,15 @@ end
 
 -- Core MCP handshake
 
-local function handshake(host, port, endpoint, session_id)
+-- poster defaults to post_rpc; pass make_sse_poster(sse_sock) for servers
+-- using the async SSE transport, where responses arrive as a pushed event on
+-- the open stream rather than in the POST response itself.
+local function handshake(host, port, endpoint, session_id, poster)
+  poster = poster or post_rpc
   local r, body
 
-  for _, init_body in ipairs({ INIT_2025, INIT_2024 }) do
-    r = post_rpc(host, port, endpoint, init_body, session_id)
+  for _, init_body in ipairs({ INIT_LATEST, INIT_2025, INIT_2024 }) do
+    r = poster(host, port, endpoint, init_body, session_id)
     if not r then return nil end
     if r.status == 200 then
       body = unwrap_sse(r.body or "")
@@ -438,7 +572,7 @@ local function handshake(host, port, endpoint, session_id)
   post_rpc(host, port, endpoint, INIT_NOTIF, session_id)
 
   local tools = fetch_paged(host, port, endpoint, session_id,
-    "tools/list", 2, function(b) return parse_tools(b) end)
+    "tools/list", 2, function(b) return parse_tools(b) end, poster)
 
   -- Fetch resources and resource templates from the same paginated response pages.
   local resources        = {}
@@ -451,7 +585,7 @@ local function handshake(host, port, endpoint, session_id)
           '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{"cursor":"%s"}}',
           cursor:gsub('"', '\\"'))
         or '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}'
-      local r2 = post_rpc(host, port, endpoint, req_body, session_id)
+      local r2 = poster(host, port, endpoint, req_body, session_id)
       if not r2 or r2.status ~= 200 then break end
       local b2 = unwrap_sse(r2.body or "")
       for _, item in ipairs(parse_resources(b2))           do resources[#resources+1]          = item end
@@ -462,17 +596,25 @@ local function handshake(host, port, endpoint, session_id)
   end
 
   local prompts = fetch_paged(host, port, endpoint, session_id,
-    "prompts/list", 4, function(b) return parse_prompts(b) end)
+    "prompts/list", 4, function(b) return parse_prompts(b) end, poster)
 
   for i = 1, math.min(#prompts, 5) do
     local p = prompts[i]
     local req = string.format(
       '{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"%s"}}',
       p.name:gsub('\\', '\\\\'):gsub('"', '\\"'))
-    local r2 = post_rpc(host, port, endpoint, req, session_id)
+    local r2 = poster(host, port, endpoint, req, session_id)
     if r2 and r2.status == 200 then
-      local text = jstr_raw(unwrap_sse(r2.body or ""), "text")
-      if text and text ~= "" then p.template = trim(text, 400) end
+      local b2 = unwrap_sse(r2.body or "")
+      local pending = pending_request(b2)
+      if sampling_attempt(b2) then
+        p.template = SAMPLING_WARNING
+      elseif pending then
+        p.template = "needs further input: " .. pending
+      else
+        local text = jstr_raw(b2, "text")
+        if text and text ~= "" then p.template = trim(text, 400) end
+      end
     end
   end
 
@@ -483,6 +625,110 @@ local function handshake(host, port, endpoint, session_id)
     srv_name           = srv_name,
     srv_ver            = srv_ver,
     caps               = caps,
+    tools              = tools,
+    resources          = resources,
+    resource_templates = resource_templates,
+    prompts            = prompts,
+    auth               = AUTH_HEADER and "AUTHENTICATED" or "UNAUTHENTICATED",
+    cors               = hdr(r, "access-control-allow-origin") == "*",
+  }
+end
+
+-- Core MCP handshake — 2026-07-28 stateless protocol.
+-- No initialize/session: bootstraps directly with a tools/list call carrying
+-- the required _meta block. Server identity comes from result._meta.serverInfo.
+-- A rejected bootstrap (-32020/-32021/-32022) is itself proof of a 2026-07-28
+-- server, since those error codes did not exist before this spec revision.
+--
+-- A bare 401 is NOT treated as confirmation here (unlike the legacy path,
+-- which requires an Mcp-Session-Id header alongside it): auth happens before
+-- any protocol-specific processing, so a 401 to /mcp can't distinguish a
+-- 2026-07-28 server from a legacy server or an unrelated authenticated API
+-- guarding the same path. Overclaiming here produced false "stateless,
+-- 2026-07-28" results against plain 2024-11-05/2025-06-18/2025-11-25 test
+-- servers that happened to 401 the bootstrap call — verified against real
+-- MCP test servers, not merely suspected. Likewise, a 200 response requires
+-- resultType, which only exists on 2026-07-28+ responses — several real
+-- legacy servers answer a bare tools/list (no prior initialize) with an
+-- ordinary legacy-shaped result, which would otherwise false-match here too.
+
+local function handshake_stateless(host, port, endpoint)
+  local boot_req = string.format('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{%s}}',
+    STATELESS_META)
+  local r = post_rpc_stateless(host, port, endpoint, boot_req, "tools/list")
+  if not r then return nil end
+
+  local body = unwrap_sse(r.body or "")
+
+  if r.status == 400 then
+    local code = stateless_error_code(body)
+    if code ~= "-32020" and code ~= "-32021" and code ~= "-32022" then return nil end
+    local msg = body:match('"message"%s*:%s*"([^"]*)"')
+    return { endpoint = endpoint, proto = STATELESS_VERSION, stateless = true,
+             caps = {}, tools = {}, resources = {}, resource_templates = {}, prompts = {},
+             note = "stateless request rejected (" .. code .. "): " .. (msg or "no message"),
+             auth = AUTH_HEADER and "AUTHENTICATED" or "UNAUTHENTICATED",
+             cors = hdr(r, "access-control-allow-origin") == "*" }
+  end
+  if r.status ~= 200 then return nil end
+  if has(hdr(r, "content-type"), "text/html") then return nil end
+  if not has(body, '"jsonrpc"') or not has(body, '"resultType"')
+  or not (has(body, '"result"') and has(body, '"tools"')) then
+    return nil
+  end
+
+  local srv_name, srv_ver = stateless_server_info(body)
+
+  local tools = fetch_paged_stateless(host, port, endpoint, "tools/list", nil, 2, parse_tools)
+
+  local resources, resource_templates = {}, {}
+  do
+    local cursor = nil
+    for _ = 1, MAX_PAGES do
+      local params = cursor
+        and string.format('"cursor":"%s",%s', cursor:gsub('"', '\\"'), STATELESS_META)
+        or STATELESS_META
+      local req_body = string.format(
+        '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{%s}}', params)
+      local r2 = post_rpc_stateless(host, port, endpoint, req_body, "resources/list")
+      if not r2 or r2.status ~= 200 then break end
+      local b2 = unwrap_sse(r2.body or "")
+      for _, item in ipairs(parse_resources(b2))          do resources[#resources+1]          = item end
+      for _, item in ipairs(parse_resource_templates(b2)) do resource_templates[#resource_templates+1] = item end
+      cursor = next_cursor(b2)
+      if not cursor then break end
+    end
+  end
+
+  local prompts = fetch_paged_stateless(host, port, endpoint, "prompts/list", nil, 4, parse_prompts)
+
+  for i = 1, math.min(#prompts, 5) do
+    local p = prompts[i]
+    local req = string.format(
+      '{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"%s",%s}}',
+      p.name:gsub('\\', '\\\\'):gsub('"', '\\"'), STATELESS_META)
+    local r2 = post_rpc_stateless(host, port, endpoint, req, "prompts/get", p.name)
+    if r2 and r2.status == 200 then
+      local b2 = unwrap_sse(r2.body or "")
+      local pending = pending_request(b2)
+      if sampling_attempt(b2) then
+        p.template = SAMPLING_WARNING
+      elseif pending then
+        p.template = "needs further input: " .. pending
+      else
+        local text = jstr_raw(b2, "text")
+        if text and text ~= "" then p.template = trim(text, 400) end
+      end
+    end
+  end
+
+  return {
+    endpoint           = endpoint,
+    proto              = STATELESS_VERSION,
+    stateless          = true,
+    srv_name           = srv_name,
+    srv_ver            = srv_ver,
+    caps               = {},
     tools              = tools,
     resources          = resources,
     resource_templates = resource_templates,
@@ -512,12 +758,95 @@ local function try_streamable(host, port, discovered)
   end
 end
 
+-- Transport: Streamable HTTP, 2026-07-28 stateless protocol
+-- Same candidate endpoints as legacy Streamable HTTP. SSE has no stateless
+-- equivalent — streaming now goes through subscriptions/listen as an ordinary
+-- request/response, not the old endpoint-discovery event stream.
+
+local function try_stateless(host, port, discovered)
+  local endpoints
+  if discovered and not discovered.is_sse then
+    endpoints = { discovered.endpoint }
+    for _, ep in ipairs(_HTTP_ENDPOINTS) do
+      if ep ~= discovered.endpoint then endpoints[#endpoints+1] = ep end
+    end
+  else
+    endpoints = _HTTP_ENDPOINTS
+  end
+  for _, ep in ipairs(endpoints) do
+    local res = handshake_stateless(host, port, ep)
+    if res then res.transport = "streamable-http (stateless, 2026-07-28)"; return res end
+  end
+end
+
 -- Transport: SSE (legacy)
 
 local _SSE_PATHS = {
   "/sse", "/events", "/stream",
   "/v1/sse", "/api/sse", "/mcp/sse", "/mcp/stream",
 }
+
+-- Opens a raw socket and issues a GET for path directly (bypassing the http
+-- library), stopping once the HTTP headers are read. Left open on success so
+-- try_sse can read further pushed events from the same stream afterward —
+-- needed because some servers answer the SSE-transport POST with a bare 202
+-- Accepted and push the actual JSON-RPC response as a later event on this
+-- connection rather than returning it in the POST response body. Returns the
+-- open socket on a 200 text/event-stream response, else nil.
+local function sse_open(host, port, path)
+  local sock = nmap.new_socket()
+  sock:set_timeout(TIMEOUT)
+  if not sock:connect(host, port) then return nil end
+  local h = "GET " .. path .. " HTTP/1.1\r\n" ..
+            "Host: " .. (host.targetname or host.ip) .. "\r\n" ..
+            "Accept: text/event-stream\r\n" ..
+            "User-Agent: nmap-http-mcp-enum/1.0\r\n" ..
+            "Connection: keep-alive\r\n"
+  if AUTH_HEADER then h = h .. AUTH_HEADER .. ": " .. AUTH_VALUE .. "\r\n" end
+  h = h .. "\r\n"
+  if not sock:send(h) then sock:close(); return nil end
+  local ok, headers = sock:receive_buf("\r\n\r\n", true)
+  if not ok then sock:close(); return nil end
+  if not headers:match("^HTTP/1%.[01] 200") or not has(headers, "text/event-stream") then
+    sock:close()
+    return nil
+  end
+  return sock
+end
+
+-- Reads the next SSE event's data: line from an open stream, tolerating
+-- chunked-transfer-encoding framing bytes (hex chunk-size prefixes) mixed in
+-- around it — those never match the "data:" pattern so they're harmlessly
+-- skipped rather than needing a full chunked decoder. Returns the data
+-- value, or nil on timeout/EOF.
+local function sse_read_data(sock)
+  for _ = 1, 20 do
+    local ok, buf = sock:receive_buf("\n\n", true)
+    if not ok then return nil end
+    local data = buf:match('data%s*:%s*([^\r\n]+)')
+    if data then return data end
+  end
+  return nil
+end
+
+-- Wraps post_rpc so that, when a server accepts a request asynchronously
+-- (any response without a usable "result"/"error" body — commonly a bare
+-- 202 Accepted with nothing in it), the actual response is instead read
+-- from the already-open SSE stream as a pushed event. Falls back to the
+-- POST's own response first, so servers that answer this transport
+-- synchronously keep working exactly as before.
+local function make_sse_poster(sse_sock)
+  return function(host, port, path, body, session_id)
+    local r = post_rpc(host, port, path, body, session_id)
+    if r and r.status == 200 then
+      local b = unwrap_sse(r.body or "")
+      if has(b, '"result"') or has(b, '"error"') then return r end
+    end
+    local data = sse_read_data(sse_sock)
+    if not data then return r end
+    return { status = 200, header = (r and r.header) or {}, body = data }
+  end
+end
 
 local function try_sse(host, port, discovered)
   local sse_paths
@@ -531,41 +860,45 @@ local function try_sse(host, port, discovered)
   end
 
   for _, sse_path in ipairs(sse_paths) do
-    local r = get_req(host, port, sse_path)
-    if not r then goto next_sse end
-    if not has(hdr(r, "content-type"), "text/event-stream") then goto next_sse end
+    local sock = sse_open(host, port, sse_path)
+    if not sock then goto next_sse end
 
-    local body = r.body or ""
+    local data = sse_read_data(sock)
+    if not data then sock:close(); goto next_sse end
+
     local msg_ep, session_id
-
-    local data_line = body:match('event%s*:%s*endpoint[^\n]*\n[^\n]*data%s*:%s*([^\r\n]+)')
-    if data_line then
-      local uri = data_line:match('"uri"%s*:%s*"([^"]+)"')
-               or data_line:match('^%s*(/[^%s\r\n]+)')
-      if uri then
-        msg_ep     = uri
-        session_id = uri:match('[?&]session[Ii][Dd]=([^&\r\n]+)')
-      end
+    local uri = data:match('"uri"%s*:%s*"([^"]+)"')
+             or data:match('^%s*(/[^%s\r\n]+)')
+    if uri then
+      msg_ep     = uri
+      session_id = uri:match('[?&]session[Ii][Dd]=([^&\r\n]+)')
     end
 
     if not msg_ep then
-      local uri = body:match('"method"%s*:%s*"endpoint"[^}]-"uri"%s*:%s*"([^"]+)"')
-      if uri then
-        msg_ep     = uri
-        session_id = uri:match('session[Ii][Dd]=([^&\r\n"]+)')
+      local uri2 = data:match('"method"%s*:%s*"endpoint"[^}]-"uri"%s*:%s*"([^"]+)"')
+      if uri2 then
+        msg_ep     = uri2
+        session_id = uri2:match('session[Ii][Dd]=([^&\r\n"]+)')
       end
     end
 
-    if not msg_ep then
-      local plain = body:match('data%s*:%s*(/[^\r\n]+)')
-      if plain and (has(plain, "message") or has(plain, "session")) then
-        msg_ep = plain:gsub('%s+$', '')
-      end
+    if not msg_ep and data:match("^/") and (has(data, "message") or has(data, "session")) then
+      msg_ep = data:gsub('%s+$', '')
     end
 
     if msg_ep then
-      local res = handshake(host, port, msg_ep, session_id)
-      if res then res.transport = "sse"; res.sse_path = sse_path; return res end
+      local res = handshake(host, port, msg_ep, session_id, make_sse_poster(sock))
+      if res then
+        -- Left open (not closed here) so action() can reuse it for tool
+        -- calls/resource reads under call=1/read=1 — same async-push
+        -- requirement applies to those as to the handshake. Closed at the
+        -- end of action() once nothing more will be read from it.
+        res.transport = "sse"; res.sse_path = sse_path; res.sse_sock = sock
+        return res
+      end
+      sock:close()
+    else
+      sock:close()
     end
 
     ::next_sse::
@@ -586,15 +919,19 @@ local function build_args(required)
   return "{" .. table.concat(parts, ",") .. "}"
 end
 
-local function call_tool(host, port, endpoint, session_id, name, required)
+local function call_tool(host, port, endpoint, session_id, name, required, poster)
+  poster = poster or post_rpc
   local req = string.format(
     '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"%s","arguments":%s}}',
     name:gsub('\\', '\\\\'):gsub('"', '\\"'), build_args(required))
-  local r = post_rpc(host, port, endpoint, req, session_id)
+  local r = poster(host, port, endpoint, req, session_id)
   if not r then return nil end
   local body = unwrap_sse(r.body or "")
   if r.status == 401 then return "401 Unauthorized" end
   if r.status == 403 then return "403 Forbidden"    end
+  if sampling_attempt(body) then return SAMPLING_WARNING end
+  local pending = pending_request(body)
+  if pending then return "needs further input: " .. pending end
   if has(body, '"error"') then
     local msg = body:match('"message"%s*:%s*"([^"]*)"')
     return "error: " .. trim(msg or "(no message)", 120)
@@ -607,15 +944,67 @@ local function call_tool(host, port, endpoint, session_id, name, required)
   return nil
 end
 
-local function read_resource(host, port, endpoint, session_id, uri)
+local function call_tool_stateless(host, port, endpoint, name, required)
   local req = string.format(
-    '{"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"%s"}}',
-    uri:gsub('\\', '\\\\'):gsub('"', '\\"'))
-  local r = post_rpc(host, port, endpoint, req, session_id)
+    '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"%s","arguments":%s,%s}}',
+    name:gsub('\\', '\\\\'):gsub('"', '\\"'), build_args(required), STATELESS_META)
+  local r = post_rpc_stateless(host, port, endpoint, req, "tools/call", name)
   if not r then return nil end
   local body = unwrap_sse(r.body or "")
   if r.status == 401 then return "401 Unauthorized" end
   if r.status == 403 then return "403 Forbidden"    end
+  if sampling_attempt(body) then return SAMPLING_WARNING end
+  local pending = pending_request(body)
+  if pending then return "needs further input: " .. pending end
+  if has(body, '"error"') then
+    local msg = body:match('"message"%s*:%s*"([^"]*)"')
+    return "error: " .. trim(msg or "(no message)", 120)
+  end
+  if r.status == 200 and has(body, '"result"') then
+    local snippet = jstr_raw(body, "text")
+    if snippet then return "ok: " .. trim(snippet, 80) end
+    return "ok"
+  end
+  return nil
+end
+
+local function read_resource(host, port, endpoint, session_id, uri, poster)
+  poster = poster or post_rpc
+  local req = string.format(
+    '{"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"%s"}}',
+    uri:gsub('\\', '\\\\'):gsub('"', '\\"'))
+  local r = poster(host, port, endpoint, req, session_id)
+  if not r then return nil end
+  local body = unwrap_sse(r.body or "")
+  if r.status == 401 then return "401 Unauthorized" end
+  if r.status == 403 then return "403 Forbidden"    end
+  if sampling_attempt(body) then return SAMPLING_WARNING end
+  local pending = pending_request(body)
+  if pending then return "needs further input: " .. pending end
+  if has(body, '"error"') then
+    local msg = body:match('"message"%s*:%s*"([^"]*)"')
+    return "error: " .. trim(msg or "(no message)", 80)
+  end
+  if r.status == 200 and has(body, '"result"') then
+    local snippet = jstr_raw(body, "text")
+    if snippet then return trim(snippet, 150) end
+    return "(non-text content)"
+  end
+  return nil
+end
+
+local function read_resource_stateless(host, port, endpoint, uri)
+  local req = string.format(
+    '{"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"%s",%s}}',
+    uri:gsub('\\', '\\\\'):gsub('"', '\\"'), STATELESS_META)
+  local r = post_rpc_stateless(host, port, endpoint, req, "resources/read")
+  if not r then return nil end
+  local body = unwrap_sse(r.body or "")
+  if r.status == 401 then return "401 Unauthorized" end
+  if r.status == 403 then return "403 Forbidden"    end
+  if sampling_attempt(body) then return SAMPLING_WARNING end
+  local pending = pending_request(body)
+  if pending then return "needs further input: " .. pending end
   if has(body, '"error"') then
     local msg = body:match('"message"%s*:%s*"([^"]*)"')
     return "error: " .. trim(msg or "(no message)", 80)
@@ -642,16 +1031,25 @@ action = function(host, port)
   local discovered = reg_ep and { endpoint = reg_ep, is_sse = false }
                   or discover_transport(host, port)
 
-  -- If .well-known/mcp says SSE, try SSE first; otherwise Streamable HTTP first.
+  -- If .well-known/mcp says SSE, try SSE first (stateless has no SSE equivalent,
+  -- so it's tried last there). Otherwise try the 2026-07-28 stateless protocol
+  -- first, then fall back to the legacy stateful handshake, then SSE.
   local res
   if discovered and discovered.is_sse then
     res = try_sse(host, port, discovered)
     if not res then res = try_streamable(host, port, discovered) end
+    if not res then res = try_stateless(host, port, discovered) end
   else
-    res = try_streamable(host, port, discovered)
+    res = try_stateless(host, port, discovered)
+    if not res then res = try_streamable(host, port, discovered) end
     if not res then res = try_sse(host, port, discovered) end
   end
   if not res then return nil end
+
+  -- Reused for tool calls/resource reads below when the SSE transport pushed
+  -- the handshake response rather than answering synchronously — the same
+  -- async requirement applies to every later request on this connection.
+  local sse_poster = res.sse_sock and make_sse_poster(res.sse_sock) or nil
 
   local out = stdnse.output_table()
 
@@ -670,15 +1068,16 @@ action = function(host, port)
 
   if res.proto      then out["protocol"]   = res.proto      end
   if res.session_id then out["session_id"] = res.session_id end
+  if res.note       then out["note"]       = res.note       end
 
   local cap_names = {}
   for k in pairs(res.caps) do cap_names[#cap_names+1] = k end
   table.sort(cap_names)
   if #cap_names > 0 then out["capabilities"] = table.concat(cap_names, ", ") end
 
-  if res.caps.sampling then
-    out["WARNING"] = "sampling capability — server can invoke LLM calls on connected clients"
-  end
+  -- Set below if a tool call, resource read, or prompt fetch turns up an
+  -- unsolicited sampling/createMessage attempt (see sampling_attempt()).
+  local sampling_seen = false
 
   do
     local notes = {}
@@ -700,8 +1099,13 @@ action = function(host, port)
         ent["params (required)"] = table.concat(t.required, ", ")
       end
       if DO_CALL then
-        local cr = call_tool(host, port, res.endpoint, res.session_id, t.name, t.required)
-        if cr then ent["call"] = cr end
+        local cr = res.stateless
+          and call_tool_stateless(host, port, res.endpoint, t.name, t.required)
+          or call_tool(host, port, res.endpoint, res.session_id, t.name, t.required, sse_poster)
+        if cr then
+          ent["call"] = cr
+          if cr == SAMPLING_WARNING then sampling_seen = true end
+        end
       end
       tool_tbl[t.name] = ent
     end
@@ -721,8 +1125,13 @@ action = function(host, port)
       if DO_READ and i <= 3 then
         local ent = stdnse.output_table()
         if rv.name ~= "" and rv.name ~= rv.uri then ent["name"] = rv.name end
-        local content = read_resource(host, port, res.endpoint, res.session_id, rv.uri)
-        if content then ent["content"] = content end
+        local content = res.stateless
+          and read_resource_stateless(host, port, res.endpoint, rv.uri)
+          or read_resource(host, port, res.endpoint, res.session_id, rv.uri, sse_poster)
+        if content then
+          ent["content"] = content
+          if content == SAMPLING_WARNING then sampling_seen = true end
+        end
         res_tbl[rv.uri] = ent
       else
         res_tbl[rv.uri] = (rv.name ~= "" and rv.name ~= rv.uri) and rv.name or ""
@@ -763,11 +1172,18 @@ action = function(host, port)
         -- Args annotated with * are required. These are the injection surface.
         ent["args"] = table.concat(p.args, ", ")
       end
-      if p.template then ent["template"] = p.template end
+      if p.template then
+        ent["template"] = p.template
+        if p.template == SAMPLING_WARNING then sampling_seen = true end
+      end
       pt[p.name] = ent
     end
     out[string.format("prompts (%d)", #res.prompts)] = pt
   end
+
+  if sampling_seen then out["WARNING"] = SAMPLING_WARNING end
+
+  if res.sse_sock then res.sse_sock:close() end
 
   return out
 end
