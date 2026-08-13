@@ -25,17 +25,23 @@ capabilities instead. Falls back to the legacy stateful JSON-RPC handshake:
   initialize (2025-11-25, falling back to 2025-03-26 then 2024-11-05)
   → notifications/initialized
 Both paths then enumerate:
-  tools/list (paginated) + inputSchema required-param extraction
+  tools/list (paginated) + inputSchema required-param extraction +
+              annotations (readOnlyHint/destructiveHint/idempotentHint/openWorldHint)
   → resources/list (paginated, static URIs + URI templates)
   → prompts/list (paginated) + prompts/get for each prompt
 
 Security signals surfaced automatically:
-  auth:         UNAUTHENTICATED / 401 scheme / 403
+  auth:         UNAUTHENTICATED / 401 scheme / 403, plus OAuth protected-resource
+                metadata (RFC 9728) when a 401 advertises or implies one
   CORS:*        Access-Control-Allow-Origin: * on the MCP endpoint
   WARNING:      server sent an unsolicited sampling/createMessage request — a protocol
                 violation, since we never declare client-side sampling support
   needs further input: a tool call, resource read, or prompt fetch was interrupted by
                 a server-initiated request (e.g. elicitation/create) we didn't fulfill
+  annotations:  per-tool DESTRUCTIVE/read-only/non-destructive tag; a tool declaring no
+                annotations at all is tagged distinctly, since the spec's own defaults
+                lean toward "assume destructive" and most real tools omit them entirely
+  capability notes: resources.subscribe — push notifications on resource changes
 
 With http-mcp-enum.call=1, each tool is called using its required parameters as keys
 with empty string values.  This gets further into tool logic than a bare {} call and
@@ -249,7 +255,46 @@ end
 
 -- JSON parsers
 
--- Tools: [{name, description, required=[]}]
+-- Resolves a tool's "annotations" block (readOnlyHint/destructiveHint/
+-- idempotentHint/openWorldHint) into a short tag. The spec's defaults lean
+-- toward "assume risk" (readOnlyHint defaults false, destructiveHint
+-- defaults true), but most real tools declare no annotations at all
+-- (confirmed against the mcp_test_servers lab) -- applying the destructive
+-- default blindly would tag every single one "DESTRUCTIVE" and the signal
+-- would drown in noise. So destructiveHint specifically tracks whether it
+-- was actually declared, and an undeclared tool is tagged distinctly from
+-- one explicitly marked destructive. destructiveHint/idempotentHint are
+-- only meaningful when readOnlyHint is false, per spec.
+local function tool_annotation_tag(obj)
+  local block = obj:match('"annotations"%s*:%s*(%b{})')
+  local function bool_field(name, default)
+    if block then
+      if block:find('"' .. name .. '"%s*:%s*true')  then return true,  true end
+      if block:find('"' .. name .. '"%s*:%s*false') then return false, true end
+    end
+    return default, false
+  end
+  local read_only  = (bool_field("readOnlyHint", false))
+  local open_world = (bool_field("openWorldHint", true))
+  if read_only then
+    return "read-only" .. (open_world == false and ", closed-world" or "")
+  end
+  local destructive, destructive_declared = bool_field("destructiveHint", true)
+  local idempotent = (bool_field("idempotentHint", false))
+  local tag
+  if not destructive_declared then
+    tag = "unannotated (spec default: assume destructive)"
+  elseif destructive then
+    tag = "DESTRUCTIVE"
+  else
+    tag = "non-destructive"
+  end
+  if destructive_declared and idempotent then tag = tag .. ", idempotent" end
+  if open_world == false then tag = tag .. ", closed-world" end
+  return tag
+end
+
+-- Tools: [{name, description, required=[], annotations}]
 -- Uses a string-aware walker instead of %b[] — Lua's %b[] counts every [ and ]
 -- including those inside JSON string values, so a description like "filter by
 -- status=active]" would terminate the array match prematurely and silently
@@ -286,7 +331,8 @@ local function parse_tools(body)
                 required[#required+1] = param
               end
             end
-            out[#out+1] = { name = name, description = desc, required = required }
+            out[#out+1] = { name = name, description = desc, required = required,
+                            annotations = tool_annotation_tag(obj) }
           end
           obj_s = nil
         end
@@ -377,6 +423,20 @@ local function parse_caps(body)
     caps[k] = true
   end
   return caps
+end
+
+-- Whether the server's "resources" capability advertises subscribe support
+-- (push notifications when a subscribed resource changes) -- parse_caps()
+-- deliberately flattens away nested sub-keys like this one, so it needs its
+-- own targeted check rather than a caps["subscribe"] lookup.
+local function resources_subscribe(body)
+  if not body then return false end
+  local res_block = body:match('"result"%s*:%s*(%b{})') or body
+  local cap_block  = res_block:match('"capabilities"%s*:%s*(%b{})')
+  if not cap_block then return false end
+  local resources_block = cap_block:match('"resources"%s*:%s*(%b{})')
+  if not resources_block then return false end
+  return resources_block:find('"subscribe"%s*:%s*true') ~= nil
 end
 
 -- JSON-RPC error code from a stateless-protocol response body (e.g. "-32021").
@@ -518,6 +578,35 @@ local function discover_transport(host, port)
   return { endpoint = path, is_sse = transport_hint and has(transport_hint, "sse") or false }
 end
 
+-- OAuth 2.0 Protected Resource Metadata (RFC 9728), advertised per the MCP
+-- authorization spec via a resource_metadata parameter on the 401's
+-- WWW-Authenticate header. Falls back to the conventional default path when
+-- that parameter is absent — some servers point clients at the well-known
+-- location without bothering to advertise it explicitly, and a client-side
+-- implementation that only trusts the header parameter would miss them.
+-- Reports a missing/empty authorization_servers as its own finding rather
+-- than treating "metadata present" and "metadata complete" as the same
+-- thing — MCP servers MUST include it, so an incomplete document is itself
+-- a spec-violation worth surfacing, not just silently skipped.
+local function oauth_metadata_summary(host, port, www_authenticate)
+  local meta_url = www_authenticate:match('resource_metadata%s*=%s*"([^"]+)"')
+  local path = meta_url and (meta_url:match("https?://[^/]+(/.+)") or meta_url:match("^(/.+)"))
+            or "/.well-known/oauth-protected-resource"
+  local r = get_req(host, port, path)
+  if not r or r.status ~= 200 or has(hdr(r, "content-type"), "text/html") then return nil end
+  local body = r.body or ""
+  if not has(body, '"resource"') then return nil end
+  local as_arr = body:match('"authorization_servers"%s*:%s*(%b[])')
+  local servers = {}
+  if as_arr then
+    for s in as_arr:gmatch('"([^"]+)"') do servers[#servers+1] = s end
+  end
+  if #servers == 0 then
+    return "protected-resource metadata present but authorization_servers is missing/empty — spec violation (MUST include at least one)"
+  end
+  return "authorization_server: " .. table.concat(servers, ", ")
+end
+
 -- Core MCP handshake
 
 -- poster defaults to post_rpc; pass make_sse_poster(sse_sock) for servers
@@ -538,12 +627,25 @@ local function handshake(host, port, endpoint, session_id, poster)
     end
   end
 
-  -- Confirmed MCP server behind auth: report the auth scheme from WWW-Authenticate.
-  if r.status == 401 and hdr(r, "mcp-session-id") ~= "" then
+  -- Confirmed MCP server behind auth: report the auth scheme from WWW-Authenticate,
+  -- plus OAuth protected-resource metadata if the server advertises any.
+  -- Confirmation: either Mcp-Session-Id (a server that got as far as assigning
+  -- one before rejecting us) or, on the distinctive /mcp path specifically, a
+  -- bare WWW-Authenticate is enough. The other candidate paths (/, /rpc, /api,
+  -- /v1) are too generic to trust on a 401 alone -- a server that rejects
+  -- *before* processing initialize structurally never has a session to set,
+  -- so requiring Mcp-Session-Id alone would miss this case entirely, which
+  -- defeats the point of OAuth discovery: its most common real use is
+  -- scanning without credentials in the first place.
+  if r.status == 401 and (hdr(r, "mcp-session-id") ~= ""
+  or (endpoint == "/mcp" and hdr(r, "www-authenticate") ~= "")) then
     local www = hdr(r, "www-authenticate")
     local scheme = (www ~= "" and www:match("^(%S+)") or "unknown")
+    local oauth = oauth_metadata_summary(host, port, www)
+    local auth_msg = "401 Unauthorized — " .. scheme .. " required"
+    if oauth then auth_msg = auth_msg .. "; " .. oauth end
     return { endpoint = endpoint,
-             auth = "401 Unauthorized — " .. scheme .. " required",
+             auth = auth_msg,
              caps = {}, tools = {}, resources = {}, resource_templates = {}, prompts = {} }
   end
   if r.status ~= 200 then return nil end
@@ -556,8 +658,9 @@ local function handshake(host, port, endpoint, session_id, poster)
   local resp_session = hdr(r, "mcp-session-id")
   if resp_session ~= "" then session_id = resp_session end
 
-  local proto = jstr(body, "protocolVersion")
-  local caps  = parse_caps(body)
+  local proto     = jstr(body, "protocolVersion")
+  local caps      = parse_caps(body)
+  local subscribe = resources_subscribe(body)
 
   local srv_name, srv_ver
   do
@@ -625,6 +728,7 @@ local function handshake(host, port, endpoint, session_id, poster)
     srv_name           = srv_name,
     srv_ver            = srv_ver,
     caps               = caps,
+    subscribe          = subscribe,
     tools              = tools,
     resources          = resources,
     resource_templates = resource_templates,
@@ -1083,6 +1187,7 @@ action = function(host, port)
     local notes = {}
     if res.caps.logging     then notes[#notes+1] = "logging: server can push log messages to connected clients" end
     if res.caps.completions then notes[#notes+1] = "completions: argument autocompletion reveals valid parameter values" end
+    if res.subscribe        then notes[#notes+1] = "resources.subscribe: server supports push notifications on resource changes" end
     if #notes > 0 then out["capability notes"] = table.concat(notes, "; ") end
   end
 
@@ -1098,6 +1203,7 @@ action = function(host, port)
       if #t.required > 0 then
         ent["params (required)"] = table.concat(t.required, ", ")
       end
+      if t.annotations then ent["annotations"] = t.annotations end
       if DO_CALL then
         local cr = res.stateless
           and call_tool_stateless(host, port, res.endpoint, t.name, t.required)

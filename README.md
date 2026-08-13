@@ -155,7 +155,7 @@ Tried in order:
 
 ### What gets enumerated
 
-- **Tools** — name, description, required parameters extracted from `inputSchema`
+- **Tools** — name, description, required parameters extracted from `inputSchema`, and an `annotations` tag (`DESTRUCTIVE` / `read-only` / `non-destructive`, with `idempotent`/`closed-world` appended when declared) resolved from the tool's `annotations` object per the spec's own defaults — a tool that declares no annotations at all is tagged `unannotated (spec default: assume destructive)` rather than silently omitted, since the spec's defaults lean toward "assume risk" and most real tools skip annotations entirely
 - **Resources** — static URIs with human-readable names
 - **Resource templates** — RFC 6570 URI patterns (e.g. `file:///{path}`, `db://{table}/{id}`) that reveal what the server can serve on demand
 - **Prompts** — names, descriptions, argument schemas (required args annotated with `*`), and template text via `prompts/get`
@@ -170,11 +170,14 @@ All list methods are paginated (`nextCursor` followed for up to `max_pages` page
 |--------|---------|
 | `auth: UNAUTHENTICATED` | Server responded to `initialize` without credentials |
 | `auth: AUTHENTICATED` | Credentials were supplied and the server responded 200 |
-| `auth: 401 Unauthorized — Bearer required` | Confirmed MCP server behind auth; scheme from `WWW-Authenticate` |
+| `auth: 401 Unauthorized — Bearer required` | Confirmed MCP server behind auth; scheme from `WWW-Authenticate`. Confirmation requires either an `Mcp-Session-Id` header on the 401, or the endpoint being the distinctive `/mcp` path with any `WWW-Authenticate` present — a server rejecting *before* processing `initialize` structurally never has a session to set, so requiring `Mcp-Session-Id` alone would miss the most common real case (scanning without credentials). |
+| `authorization_server: <url>` | OAuth 2.0 Protected Resource Metadata (RFC 9728), fetched from the `resource_metadata` URL in `WWW-Authenticate` if present, falling back to the conventional `/.well-known/oauth-protected-resource` path otherwise |
+| `protected-resource metadata present but authorization_servers is missing/empty — spec violation` | The metadata document exists but omits the one field MCP servers **MUST** include — reported as its own finding rather than treated the same as "no metadata at all" |
 | `CORS:*` | `Access-Control-Allow-Origin: *` on the MCP endpoint — any web origin can call this server |
 | `WARNING: ...unsolicited sampling/createMessage...` | Server attempted to invoke an LLM completion through us despite never being granted sampling support — a protocol violation, and a real attempt (not just a declared capability) to consume the client's API credits or exfiltrate context. Checked on every `prompts/get` call (runs by default) and, with `call=1`/`read=1`, on every tool call and resource read. |
 | `capability notes: logging` | Server can push log messages to connected clients |
 | `capability notes: completions` | Argument autocompletion reveals valid parameter values |
+| `capability notes: resources.subscribe` | Server supports push notifications when a subscribed resource changes |
 | `needs further input: <method>` | A tool call, resource read, or prompt fetch was interrupted by a server-initiated request (e.g. `elicitation/create`) instead of completing — reported rather than silently dropped; the round-trip itself isn't attempted |
 
 ### Script arguments
@@ -233,10 +236,12 @@ PORT     STATE SERVICE
 |     read_file:
 |       description: Read the contents of a file from the filesystem
 |       params (required): path
+|       annotations: read-only
 |       call: error: path "" is not a valid file path
 |     execute_bash:
 |       description: Execute a shell command and return stdout/stderr
 |       params (required): command
+|       annotations: DESTRUCTIVE
 |       call: ok: (empty command, no output)
 |   resources (4):
 |     file:///home/app/config.yaml: Application config
