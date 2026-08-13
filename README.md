@@ -67,11 +67,11 @@ When an MCP server is found, its endpoint path is shared with `http-mcp-enum.nse
 | Frontends / UIs | Open WebUI, AnythingLLM, ComfyUI, Flowise, Langflow, SillyTavern, LibreChat, Dify, Chainlit |
 | Observability | Langfuse, Arize Phoenix |
 | Speech / TTS | Whisper-compatible STT servers, Coqui TTS, AllTalk TTS |
-| RAG infrastructure | Unstructured API |
+| RAG infrastructure | Unstructured API, Hayhooks (Haystack) |
 | OpenAI-compatible | Any server exposing `/v1/models` (fingerprinted against known servers) |
 | FastAPI catch-all | Any FastAPI service with AI-related paths or title in `/openapi.json` |
 | Vector databases | ChromaDB, Qdrant, Weaviate, Milvus, Typesense |
-| ML platforms | MLflow, Jupyter, Ray Dashboard, TensorBoard, n8n, Determined AI, ClearML |
+| ML platforms | MLflow, Jupyter, Ray Dashboard, Ray Serve, TensorBoard, n8n, Determined AI, ClearML |
 | GPU / infra | NVIDIA DCGM Exporter, generic AI Prometheus metrics (vLLM, llama.cpp, SGLang, etc.) |
 | Model files | Directory listings exposing `.gguf`, `.safetensors`, `.onnx` model weights |
 | MCP | Model Context Protocol servers — header detection, `.well-known/mcp`, SSE transport, JSON-RPC `initialize` (active POST, disableable) |

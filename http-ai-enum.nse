@@ -21,13 +21,13 @@ Identified services:
   Compatible:  Any OpenAI-compatible /v1/models endpoint, FastAPI services
                exposing /openapi.json with AI-related paths
   Vector DBs:  ChromaDB, Qdrant, Weaviate, Milvus
-  Platforms:   MLflow, Jupyter, Ray Dashboard, TensorBoard, n8n
+  Platforms:   MLflow, Jupyter, Ray Dashboard, Ray Serve, TensorBoard, n8n
   GPU/Infra:   NVIDIA DCGM Exporter, generic AI Prometheus metrics
   Files:       Directory listings exposing .gguf / .safetensors / .onnx
                (checks /, /models, /weights, /checkpoints)
   Observability: Langfuse, Arize Phoenix
   Speech/TTS:  Whisper-compatible STT servers, Coqui TTS, AllTalk TTS
-  RAG infra:   Unstructured API
+  RAG infra:   Unstructured API, Hayhooks (Haystack)
   ML Platforms: Determined AI, ClearML
   Chat UI:     Chainlit
   Search:      Typesense
@@ -95,6 +95,7 @@ local _EXTRA_PORTS = {
   11434,  -- Ollama
   11435,  -- Ollama alt
   30000,  -- SGLang
+  1416,   -- Hayhooks (Haystack pipelines)
 }
 
 portrule = function(host, port)
@@ -451,6 +452,18 @@ PROBES[#PROBES+1] = function(cget, _)
     return { service = "Langflow", path = "/api/v1/health_check",
              auth = auth_of(r), cors = cors_open(r) }
   end
+end
+
+-- Hayhooks (Haystack pipelines deployed as REST APIs)
+-- /status is Hayhooks-specific: {"pipelines": [...], "status": "..."} — the
+-- "pipelines" array is the distinguishing field, not just a generic "status" key.
+
+PROBES[#PROBES+1] = function(cget, _)
+  local r = cget("/status")
+  if not r or r.status ~= 200 or is_html(r) then return nil end
+  if not has(r.body, '"pipelines"') or not has(r.body, '"status"') then return nil end
+  return { service = "Hayhooks (Haystack)", path = "/status",
+           auth = auth_of(r), cors = cors_open(r) }
 end
 
 -- SillyTavern
@@ -873,6 +886,22 @@ PROBES[#PROBES+1] = function(cget, _)
              auth = auth_of(r), cors = cors_open(r),
              version = jstr(r.body, "rayVersion") }
   end
+end
+
+-- Ray Serve
+-- /api/serve/applications/ runs on the same port as the Ray Dashboard above.
+-- Trailing slash is required — without it the endpoint 404s (confirmed
+-- against a real Ray 2.57.0 instance; not documented anywhere obviously).
+-- "proxies" (per-node ingress routing info) is Serve-specific — the generic
+-- cluster_status probe above has no such field, so this only fires when
+-- Serve is actually deployed on the cluster, not just the dashboard.
+
+PROBES[#PROBES+1] = function(cget, _)
+  local r = cget("/api/serve/applications/")
+  if not r or r.status ~= 200 or is_html(r) then return nil end
+  if not has(r.body, '"applications"') or not has(r.body, '"proxies"') then return nil end
+  return { service = "Ray Serve", path = "/api/serve/applications/",
+           auth = auth_of(r), cors = cors_open(r) }
 end
 
 -- n8n
